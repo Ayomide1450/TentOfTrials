@@ -116,13 +116,39 @@ class LogParser:
 class JSONLogParser(LogParser):
     """Parses structured JSON log lines."""
 
+    def _coerce_timestamp(self, raw: Any) -> Optional[int]:
+        if raw is None:
+            return None
+        if isinstance(raw, (int, float)):
+            return int(raw)
+        if isinstance(raw, str):
+            for fmt in [
+                '%Y-%m-%dT%H:%M:%S',
+                '%Y-%m-%dT%H:%M:%SZ',
+                '%Y-%m-%dT%H:%M:%S%z',
+                '%Y-%m-%d %H:%M:%S',
+                '%Y-%m-%d %H:%M:%S%z',
+                '%d/%b/%Y:%H:%M:%S %z',
+            ]:
+                try:
+                    dt = datetime.strptime(raw, fmt)
+                    return int(dt.replace(tzinfo=timezone.utc).timestamp())
+                except ValueError:
+                    continue
+            try:
+                return int(float(raw))
+            except (ValueError, TypeError):
+                pass
+        return None
+
     def parse(self, line: str) -> Optional[Dict[str, Any]]:
         try:
             entry = json.loads(line.strip())
             if not isinstance(entry, dict):
                 return None
+            raw_ts = entry.get('timestamp') or entry.get('time') or entry.get('@timestamp')
             return {
-                'timestamp': entry.get('timestamp') or entry.get('time') or entry.get('@timestamp'),
+                'timestamp': self._coerce_timestamp(raw_ts),
                 'level': entry.get('level') or entry.get('severity') or entry.get('lvl', 'info'),
                 'service': entry.get('service') or entry.get('logger') or entry.get('app'),
                 'message': entry.get('message') or entry.get('msg') or entry.get('event', ''),
@@ -187,7 +213,7 @@ class NginxLogParser(LogParser):
             'message': match.group(5),
             'fields': {
                 'remote_addr': match.group(1),
-                'remote_user': match.group(2),
+                'remote_user': match.group(3),
                 'request': match.group(5),
                 'status': status_code,
                 'body_bytes': match.group(7),
@@ -204,7 +230,7 @@ class NginxLogParser(LogParser):
 
 class LogAggregator:
     def __init__(self):
-        self.parsers = [JSONLogParser(), TextLogParser(), NginxLogParser()]
+        self.parsers = [JSONLogParser(), NginxLogParser(), TextLogParser()]
         self.entries: List[Dict[str, Any]] = []
         self.level_counts: Counter = Counter()
         self.service_counts: Counter = Counter()
@@ -246,9 +272,12 @@ class LogAggregator:
             if entry:
                 self.entries.append(entry)
                 ts = entry.get('timestamp')
-                if ts:
-                    hour = datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%Y-%m-%dT%H:00')
-                    self.hourly_counts[hour] += 1
+                if isinstance(ts, (int, float)):
+                    try:
+                        hour = datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%Y-%m-%dT%H:00')
+                        self.hourly_counts[hour] += 1
+                    except (OSError, OverflowError, ValueError):
+                        pass
                 level = entry.get('level', 'unknown').lower()
                 self.level_counts[level] += 1
                 service = entry.get('service', 'unknown')
@@ -280,7 +309,7 @@ class LogAggregator:
     def _get_time_range(self) -> Optional[Dict[str, str]]:
         timestamps = [
             e['timestamp'] for e in self.entries
-            if e.get('timestamp')
+            if isinstance(e.get('timestamp'), (int, float))
         ]
         if not timestamps:
             return None
